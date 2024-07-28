@@ -1,0 +1,337 @@
+import os
+import streamlit as st
+from openai import OpenAI
+import time
+import PyPDF2
+import docx
+import json
+import streamlit.components.v1 as components
+import plotly.graph_objects as go
+import plotly.express as px
+import pandas as pd
+import numpy as np
+from lifelines import KaplanMeierFitter
+import logging
+import camelot
+import matplotlib.pyplot as plt
+
+logging.basicConfig(level=logging.INFO)
+
+# Set your OpenAI API key here
+os.environ["OPENAI_API_KEY"] = "your-api-key-here"  # Replace with your actual API key
+
+client = OpenAI()
+
+def create_assistants():
+    assistants = {}
+    
+    base_instructions = """
+    You are a professional scientific medical writing assistant specializing in transforming Clinical Study Reports (CSRs) and other source documents into various publication types.
+    Utilize the following capabilities to enhance your output:
+    
+    1. Data Analysis: Use pandas and numpy for in-depth data analysis, including summary statistics, correlations, and data transformations.
+    2. Visualization: Create matplotlib or plotly visualizations for data representation. Save figures as 'figure.png'.
+    3. Statistical Analysis: Perform relevant statistical tests (t-tests, ANOVA, etc.) using scipy or statsmodels when appropriate.
+    4. Text Processing: Utilize NLTK for advanced text analysis of medical documents when needed.
+    5. Custom Functions: Define and use functions for repetitive tasks in medical data analysis.
+
+    When presenting data or creating visualizations, use Python code blocks. Ensure all code is executable and save any generated figures as 'figure.png'.
+    """
+
+    manuscript_instructions = base_instructions + """
+    Structure: Title, Authors (placeholder), Abstract, Introduction, Methods, Results, Discussion, Conclusion.
+    - Keep content comprehensive and suitable for high-impact journals.
+    - Include detailed descriptions of methods, results, and their implications.
+    - Utilize data analysis and visualization capabilities to present findings effectively.
+    - Perform and report relevant statistical analyses to support conclusions.
+    """
+
+    congress_abstract_instructions = base_instructions + """
+    Structure: Title, Background, Methods, Results, Conclusion.
+    - Create a concise abstract (250-300 words) suitable for conference submission.
+    - Focus on key findings and their significance.
+    - Use data analysis to highlight the most important results.
+    - Do not include visualizations in the abstract itself, but you may use analysis to inform the content.
+    """
+
+    poster_instructions = base_instructions + """
+    Structure: Title, Introduction, Methods, Results, Conclusion, References.
+    - Create content suitable for a visual poster presentation.
+    - Use concise language and highlight key points.
+    - Utilize visualizations to present data effectively.
+    - Include brief but impactful statistical analyses to support main findings.
+    """
+
+    assistants["Manuscript"] = client.beta.assistants.create(
+        name="Manuscript Writing Assistant",
+        instructions=manuscript_instructions,
+        model="gpt-4o",
+        tools=[{"type": "code_interpreter"}]
+    )
+
+    assistants["Congress Abstract"] = client.beta.assistants.create(
+        name="Congress Abstract Writing Assistant",
+        instructions=congress_abstract_instructions,
+        model="gpt-4o",
+        tools=[{"type": "code_interpreter"}]
+    )
+
+    assistants["Poster"] = client.beta.assistants.create(
+        name="Poster Writing Assistant",
+        instructions=poster_instructions,
+        model="gpt-4o",
+        tools=[{"type": "code_interpreter"}]
+    )
+
+    return assistants
+
+def generate_document(assistant_id, doc_type, user_input, additional_instructions):
+    try:
+        thread = client.beta.threads.create()
+        
+        full_prompt = f"""
+        IMPORTANT: You are generating a {doc_type}. Strictly adhere to the format and guidelines for a {doc_type}.
+
+        Document Type: {doc_type}
+
+        Input:
+        {user_input}
+
+        Additional Instructions:
+        {additional_instructions}
+
+        Remember to follow all guidelines specific to a {doc_type}, including structure, word limits, and visualization requirements.
+
+        Utilize data analysis, visualization, and statistical testing capabilities as appropriate. Include Python code blocks for any data processing or visualization. Save any generated figures as 'figure.png'.
+
+        For data presentation, use the following format:
+        ```python
+        # Your Python code here
+        # Example:
+        import pandas as pd
+        import matplotlib.pyplot as plt
+
+        # Data processing
+        data = ...  # Your data processing here
+
+        # Visualization
+        plt.figure(figsize=(10, 6))
+        # Your plotting code here
+        plt.title("Your Title")
+        plt.savefig('figure.png')
+        plt.close()
+        ```
+
+        Ensure all code is executable and relevant to the document type and content.
+        """
+        
+        message = client.beta.threads.messages.create(
+            thread_id=thread.id,
+            role="user",
+            content=full_prompt
+        )
+
+        run = client.beta.threads.runs.create(
+            thread_id=thread.id,
+            assistant_id=assistant_id
+        )
+
+        while run.status != 'completed':
+            time.sleep(1)
+            run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+
+        messages = client.beta.threads.messages.list(thread_id=thread.id)
+        
+        for msg in messages.data:
+            if msg.role == 'assistant':
+                return msg.content[0].text.value
+
+        return "No response generated."
+
+    except Exception as e:
+        st.error(f"Error in generate_document: {str(e)}")
+        return None
+
+def normalize_data_length(df):
+    max_length = max(len(df[col]) for col in df.columns)
+    for col in df.columns:
+        if len(df[col]) < max_length:
+            df[col] = df[col].tolist() + [None] * (max_length - len(df[col]))
+    return df
+
+def create_bar_chart(df, x_col, y_cols, title, labels):
+    try:
+        df = normalize_data_length(df)
+        fig = px.bar(df, x=x_col, y=y_cols, title=title, labels=labels)
+        fig.update_layout(barmode='group')
+        return fig
+    except ValueError as e:
+        st.error(f"Error creating bar chart: {str(e)}")
+        st.error(f"Expected columns: {y_cols}, but received different column lengths in the dataframe.")
+        return None
+
+def create_line_chart(df, x_col, y_cols, title, labels):
+    try:
+        df = normalize_data_length(df)
+        fig = px.line(df, x=x_col, y=y_cols, title=title, labels=labels)
+        return fig
+    except ValueError as e:
+        st.error(f"Error creating line chart: {str(e)}")
+        st.error(f"Expected columns: {y_cols}, but received different column lengths in the dataframe.")
+        return None
+
+def create_forest_plot(df, y_col, x_col, ci_lower, ci_upper, title):
+    try:
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=df[x_col],
+            y=df[y_col],
+            mode='markers',
+            name='Point Estimate',
+            marker=dict(size=10, color='blue'),
+            error_x=dict(
+                type='data',
+                symmetric=False,
+                array=df[ci_upper] - df[x_col],
+                arrayminus=df[x_col] - df[ci_lower],
+                color='black'
+            )
+        ))
+        
+        fig.add_shape(type="line", x0=1, x1=1, y0=-1, y1=len(df), line=dict(color="red", dash="dash"))
+        
+        fig.update_layout(
+            title=title,
+            xaxis_title="Odds Ratio (95% CI)",
+            yaxis_title="Study",
+            yaxis=dict(autorange="reversed")
+        )
+        
+        return fig
+    except Exception as e:
+        st.error(f"Error creating forest plot: {str(e)}")
+        return None
+
+def create_kaplan_meier_plot(df, time_col, event_col, group_col, title):
+    try:
+        fig = go.Figure()
+        
+        for group in df[group_col].unique():
+            mask = df[group_col] == group
+            kmf = KaplanMeierFitter()
+            kmf.fit(df[mask][time_col], df[mask][event_col], label=group)
+            
+            fig.add_trace(go.Scatter(
+                x=kmf.timeline,
+                y=kmf.survival_function_.values.flatten(),
+                mode='lines',
+                name=group
+            ))
+        
+        fig.update_layout(
+            title=title,
+            xaxis_title="Time",
+            yaxis_title="Survival Probability",
+            yaxis=dict(range=[0, 1])
+        )
+        
+        return fig
+    except Exception as e:
+        st.error(f"Error creating Kaplan-Meier plot: {str(e)}")
+        return None
+
+def create_pie_chart(df, values_col, names_col, title):
+    try:
+        fig = px.pie(df, values=values_col, names=names_col, title=title)
+        return fig
+    except Exception as e:
+        st.error(f"Error creating pie chart: {str(e)}")
+        return None
+
+def create_box_plot(df, x_col, y_col, title):
+    try:
+        fig = px.box(df, x=x_col, y=y_col, title=title)
+        return fig
+    except Exception as e:
+        st.error(f"Error creating box plot: {str(e)}")
+        return None
+
+def parse_and_visualize(content, doc_type):
+    if not content:
+        st.error("No content to parse and visualize.")
+        return
+
+    try:
+        content_dict = json.loads(content)
+    except json.JSONDecodeError:
+        st.error("Failed to parse visualization data. Please check the format.")
+        return
+
+    for key, value in content_dict.items():
+        if key == "visualization_data":
+            for viz in value:
+                try:
+                    df = pd.DataFrame(viz["data"])
+                    if viz["chart_type"] == "Bar chart":
+                        fig = create_bar_chart(df, viz["x"], viz["y"], viz["title"], viz["labels"])
+                        st.plotly_chart(fig)
+                    elif viz["chart_type"] == "Line chart":
+                        fig = create_line_chart(df, viz["x"], viz["y"], viz["title"], viz["labels"])
+                        st.plotly_chart(fig)
+                    elif viz["chart_type"] == "Forest plot":
+                        fig = create_forest_plot(df, viz["y"], viz["x"], viz["ci_lower"], viz["ci_upper"], viz["title"])
+                        st.plotly_chart(fig)
+                    elif viz["chart_type"] == "Kaplan-Meier plot":
+                        fig = create_kaplan_meier_plot(df, viz["time_col"], viz["event_col"], viz["group_col"], viz["title"])
+                        st.plotly_chart(fig)
+                    elif viz["chart_type"] == "Pie chart":
+                        fig = create_pie_chart(df, viz["values"], viz["names"], viz["title"])
+                        st.plotly_chart(fig)
+                    elif viz["chart_type"] == "Box plot":
+                        fig = create_box_plot(df, viz["x"], viz["y"], viz["title"])
+                        st.plotly_chart(fig)
+                    else:
+                        st.error(f"Unsupported chart type: {viz['chart_type']}")
+                except KeyError as e:
+                    st.error(f"Missing required key for {viz['chart_type']}: {str(e)}")
+                except Exception as e:
+                    st.error(f"Error parsing visualization data: {str(e)}")
+        else:
+            st.write(f"**{key}:** {value}")
+
+def main():
+    st.title("Publication Copilot")
+
+    assistants = create_assistants()
+
+    doc_type = st.selectbox("Select document type", ["Congress Abstract", "Manuscript", "Poster"])
+    
+    user_input = st.text_area("Enter your clinical study information:", height=300)
+    additional_instructions = st.text_area("Additional instructions (optional):", height=100)
+
+    if st.button("Generate"):
+        if user_input:
+            with st.spinner("Generating content..."):
+                try:
+                    generated_content = generate_document(assistants[doc_type].id, doc_type, user_input, additional_instructions)
+                    
+                    if generated_content:
+                        st.subheader("Generated Content:")
+                        parse_and_visualize(generated_content, doc_type)
+                        
+                        st.download_button(
+                            label="Download as Text",
+                            data=generated_content,
+                            file_name=f"{doc_type.lower().replace(' ', '_')}.txt",
+                            mime="text/plain"
+                        )
+                    else:
+                        st.warning("No content was generated. Please try again.")
+                except Exception as e:
+                    st.error(f"Error generating document: {str(e)}")
+        else:
+            st.warning("Please enter some information before generating.")
+
+if __name__ == '__main__':
+    main()
